@@ -7,7 +7,7 @@ This tool is able to enroll the status (content and metadata) for any number of 
 
 Example use cases include users' .profile, .bashrc, and authorized_keys files. These and many other configuration files in Linux reside in the user's home folder are owned by that user. However, this leaves them open to tampering by any malicious code or actor running as that user. Since some of these files are basically shell scripts, this can lead to persistent malware without any root exploits.
 
-python3 sen.py [generate filelist.txt] | [daemon] | [status] | [log] | [checkonce] | [daemonstop]
+python3 sen.py [generate filelist.txt] | [daemon] | [status] | [log] | [checkonce] | [daemonstop] | [enroll "/path/to/file"]
 
 Basic Usage:
 
