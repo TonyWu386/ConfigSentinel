@@ -1,5 +1,5 @@
 #--------------------------------------------------------
-# ConfigSentinel v0.2
+# ConfigSentinel v0.3
 #
 # Requires python3, python-daemon, ssmtp, and coreutils.
 #
@@ -22,6 +22,7 @@ from time import sleep
 from signal import SIGTERM, SIGTSTP
 from datetime import datetime
 from lockfile import FileLock
+from os import stat
 import sqlite3
 import daemon
 
@@ -130,14 +131,14 @@ def generateDB(inputFile):
                 print("Duplicate files detected in input file")
                 return 1
             for file in trackedFiles:
-                if (Path(DBFILE).is_symlink()):
+                if (Path(file).is_symlink()):
                     print("Symlinks are not supported")
                     return 1
                 try:
                     pipe = Popen([CHECKSUMTOOL, file], stdout=PIPE)
                 except Exception:
                     print("Cannot open file to be tracked: " + file)
-                    call(["rm", TEMPFILE])
+                    call(["rm", DBFILE])
                     return 1
                 checksum = pipe.communicate()[0].decode('ascii').split(" ")[0]
                 conn.execute('''INSERT INTO Files(
@@ -190,7 +191,6 @@ def enrollFile(path):
             pipe = Popen([CHECKSUMTOOL, path], stdout=PIPE)
         except Exception:
             print("Cannot open file to be tracked: " + path)
-            call(["rm", TEMPFILE])
             return 1
         checksum = pipe.communicate()[0].decode('ascii').split(" ")[0]
         
@@ -285,7 +285,8 @@ def performCheck():
 
                 if (autoEmail == 1):
                     sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
-                              "\nSubject:" + EMAILSUBJECT["deletion"] + "\n\n")
+                              "\nSubject:" + EMAILSUBJECT["deletion"] + \
+                              "\n\n" + path + "\n")
                 continue
 
 
@@ -326,8 +327,9 @@ def performCheck():
                          currentMetadata["permission"]))
 
                 if (autoRestore == 1):
-                    if (Path(path).is_symlink()):
-                        call(["rm", path])
+                    targetFile = Path(path)
+                    if (targetFile.is_symlink()):
+                        targetFile.unlink()
                         recreateFile(path=path, rawFileData=goodRawData,
                             permission=goodPermission, fileOwner=goodFileOwner,
                             fileGroup=goodFileGroup)
@@ -345,7 +347,8 @@ def performCheck():
 
                 if (autoEmail == 1):
                     sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
-                              "\nSubject:" + EMAILSUBJECT["metadata"] + "\n\n")
+                              "\nSubject:" + EMAILSUBJECT["metadata"] + \
+                              "\n\n" + path + "\n")
 
 
             if (checksumMismatch):
@@ -384,10 +387,12 @@ def performCheck():
 
                 if (autoEmail == 1):
                     sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
-                              "\nSubject:" + EMAILSUBJECT["checksum"] + "\n\n")
+                              "\nSubject:" + EMAILSUBJECT["checksum"] + \
+                              "\n\n" + path + "\n")
 
 
 def displayStatus():
+
     if (not Path(DBFILE).is_file()):
         print("DB file has not been generated")
         return 1
@@ -407,10 +412,11 @@ def displayStatus():
             degraded = row[3]
             print(str(autoRestore) + "           -- " + str(autoEmail) + \
                   "         -- " + str(degraded) + "        --  " + path)
-        return 0
+    return 0
 
 
 def displayLog():
+
     if (not Path(DBFILE).is_file()):
         print("DB file has not been generated")
         return 1
@@ -432,12 +438,17 @@ def displayLog():
 
 
 def shutdown(signum, frame):
-    call(["rm", "-f", COMMANDFILE])
+    # Responds to SIGTERM and SIGTSTP
+
+    commandFile = Path(COMMANDFILE)
+    if (commandFile.exists()):
+        commandFile.unlink()
     global exitFlag
     exitFlag = 1
 
 
 def main():
+
     global exitFlag
 
     if (Path(DAEMONLOCK).is_file()):
@@ -458,23 +469,30 @@ def main():
 def getFileMetadata(path):
     # Give the path to a file, return a dict with its metadata
 
-    pipe = Popen(["ls", "-l", path], stdout=PIPE)
-    fileInfo = pipe.communicate()[0].decode('ascii').split(" ")
+    targetFile = Path(path)
 
-    pipe = Popen(["stat", "-c", "\"%a\"", path], stdout=PIPE)
-    permission = pipe.communicate()[0].decode('ascii')\
-                .rstrip().replace("\"","")
+    permission = str(oct(stat(path).st_mode))[-3:]
 
-    return {"permission":permission, "owner":fileInfo[2],
-            "group":fileInfo[3]}
+    return {"permission":permission, "owner":targetFile.owner(),
+            "group":targetFile.group()}
 
 
 def validateEnvironment():
     # Validates if the system is in a ready-to-run state
 
+    if (INTERVAL < 1):
+        print("Constant INTERVAL must NOT be less than 1")
+        return 1
+    if (AUTORESTOREDEFAULT not in (0, 1)):
+        print("Constant AUTORESTOREDEFAULT must be 0 or 1")
+        return 1
+    if (AUTOEMAILDEFAULT not in (0, 1)):
+        print("Constant AUTOEMAILDEFAULT must be 0 or 1")
+        return 1
     if (not Path(DBFILE).is_file()):
         print("DB file does not exist")
         return 1
+
     dbFileMetadata = getFileMetadata(DBFILE)
     if (dbFileMetadata["owner"] != "root"):
         print("DB file is not owned by root (this is very insecure)")
@@ -485,6 +503,7 @@ def validateEnvironment():
     if (dbFileMetadata["permission"][-1] != "0"):
         print("DB file's permission is insecure (last digit must be 0)")
         return 1
+
     return 0
 
 
@@ -506,11 +525,18 @@ if __name__ == "__main__":
             else:
                 performCheck()
         elif (argv[1] == "daemonstop"):
-            print("Signalling daemon to stop")
-            call(["rm", "-f", COMMANDFILE])
+            commandFile = Path(COMMANDFILE)
+            if (commandFile.exists()):
+                print("Signalling daemon to stop")
+                commandFile.unlink()
+            else:
+                print("Daemon is not running")
         elif (argv[1] == "daemon"):
+            commandFile = Path(COMMANDFILE)
             if (validateEnvironment() != 0):
                 print("Cannot start daemon")
+            elif (commandFile.exists()):
+                print("Daemon is already running")
             else:
                 print("Starting up daemon...")
                 with daemon.DaemonContext(
@@ -531,9 +557,7 @@ if __name__ == "__main__":
             else:
                 print("DB generation failure")
         elif (argv[1] == "enroll"):
-            if len(argv[2]) < 3:
-                print("Invalid file: " + argv[2])
-            elif (not Path(argv[2]).is_file()):
+            if (not Path(argv[2]).is_file()):
                 print("Invalid file: " + argv[2])
             else:
                 enrollFile(argv[2])
