@@ -109,7 +109,8 @@ def generateDB(inputFile):
                 with open(path, 'rb') as f:
                     fileRawData = f.read()
 
-                _createFileEntry(conn, path=path, checksum=checksum, metadata=metadata, fileRawData=fileRawData)
+                _createFileEntry(conn, path=path, checksum=checksum,
+                                 metadata=metadata, fileRawData=fileRawData)
 
         conn.commit()
 
@@ -143,7 +144,8 @@ def enrollFile(path):
         with open(path, 'rb') as f:
             fileRawData = f.read()
 
-        _createFileEntry(conn, path=path, checksum=checksum)
+        _createFileEntry(conn, path=path, checksum=checksum,
+                         metadata=metadata, fileRawData=fileRawData)
 
         conn.commit()
 
@@ -271,8 +273,10 @@ def performCheck():
                                       fileOwner=goodFileOwner,
                                       fileGroup=goodFileGroup)
                     else:
-                        _setFileMetadata(path=path, permission=goodPermission,
-                                         fileOwner=goodFileOwner, fileGroup=goodFileGroup)
+                        _setFileMetadata(path=path,
+                                         permission=goodPermission,
+                                         fileOwner=goodFileOwner,
+                                         fileGroup=goodFileGroup)
                 else:
                     # If not restored, a file is marked degraded and ignored
                     _setFileDegraded(conn, fileID)
@@ -314,7 +318,7 @@ def performCheck():
                 conn.commit();
 
             elif (modTimeMismatch):
-                # File contents unchanged, but modification timestamp has changed
+                # File contents unchanged, but modification timestamp changed
 
                 if (autoEmail == 1):
                     sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
@@ -390,8 +394,10 @@ def getFileMetadata(path):
 
     permission = str(oct(stat(path).st_mode))[-3:]
 
-    return {"permission":permission, "owner":targetFile.owner(),
-            "group":targetFile.group(), "modtime":str(round(targetFile.stat().st_mtime))}
+    return {"permission":permission,
+            "owner":targetFile.owner(),
+            "group":targetFile.group(),
+            "modtime":str(round(targetFile.stat().st_mtime))}
 
 
 def displayStatus():
@@ -402,7 +408,8 @@ def displayStatus():
 
     with sqlite3.connect(DBFILE) as conn:
         print("AutoRestore -- AutoEmail -- Degraded -- Path")
-        print("--------------------------------------------------------------------------------")
+        print(('--------------------------------------------------------------'
+               '------------------'))
         for row in conn.execute('''SELECT
                                 Path,
                                 AutoRestore,
@@ -414,7 +421,8 @@ def displayStatus():
             autoEmail = row[2]
             degraded = row[3]
             print("{}           -- {}         -- {}        --  {}"
-                  .format(str(autoRestore), str(autoEmail), str(degraded), path))
+                  .format(str(autoRestore), str(autoEmail),
+                          str(degraded), path))
     return 0
 
 
@@ -425,8 +433,10 @@ def displayFileStatus():
         return 1
 
     with sqlite3.connect(DBFILE) as conn:
-        print("Checksum (" + CHECKSUMTOOL + ")       -- Permission  -- Owner:Group -- ModTime      -- Path")
-        print("--------------------------------------------------------------------------------")
+        print(('Checksum (' + CHECKSUMTOOL + ')       -- Permission  -- Owner:'
+               'Group -- ModTime      -- Path'))
+        print(('--------------------------------------------------------------'
+               '------------------'))
         for row in conn.execute('''SELECT
                                 f.Path,            -- 0
                                 f.GoodChecksum,    -- 1
@@ -444,7 +454,8 @@ def displayFileStatus():
             goodGroup = row[4]
             goodModTime = row[5]
             print("{}..     -- {}         -- {}:{}   -- {}   -- {}"
-                  .format(goodChecksum[:20], goodPermission, goodOwner, goodGroup, goodModTime, path))
+                  .format(goodChecksum[:20], goodPermission, goodOwner,
+                          goodGroup, goodModTime, path))
     return 0
 
 
@@ -456,7 +467,8 @@ def displayLog():
 
     with sqlite3.connect(DBFILE) as conn:
         print("Timestamp            --  Mismatch  --  Path")
-        print("--------------------------------------------------------------------------------")
+        print(('--------------------------------------------------------------'
+               '------------------'))
         for row in conn.execute('''SELECT
                                 f.Path,
                                 l.Timestamp,
@@ -492,7 +504,8 @@ def main():
     while (exitFlag == 0):
         performCheck()
         with open(COMMANDFILE, 'w') as f:
-            f.write("Daemon running!\nLast check " + str(datetime.now()) + "\n")
+            f.write("Daemon running!\nLast check " + \
+                    str(datetime.now()) + "\n")
         timeToCheck = INTERVAL
         while (exitFlag == 0 and timeToCheck > 0):
             if (not Path(COMMANDFILE).is_file()):
