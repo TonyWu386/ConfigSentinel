@@ -1,7 +1,7 @@
 #--------------------------------------------------------
-# ConfigSentinel v0.4
+# ConfigSentinel v0.5
 #
-# Requires python3, python-daemon, ssmtp, and coreutils.
+# Requires python3, python-daemon, inotify, ssmtp, and coreutils.
 #
 # Run as root. Ensure the working directory and DB file
 # can only be modified by root.
@@ -23,8 +23,10 @@ from signal import SIGTERM, SIGTSTP
 from datetime import datetime
 from lockfile import FileLock
 from os import stat
+from getopt import gnu_getopt, GetoptError
 import sqlite3
 import daemon
+import inotify.adapters
 
 # Set this to your own email for alerts (requires ssmtp/sendmail)
 EMAIL = "nobody@localhost"
@@ -38,11 +40,14 @@ DAEMONLOCK = "/var/run/sen.pid"
 
 DBFILE = WORKINGDIR + "SenDB.db"
 COMMANDFILE = WORKINGDIR + "Command.txt"
+REFRESHFLAGFILE = WORKINGDIR + ".refresh"
 
 DBCREATIONQUERY = "generateDB.sql"
 
-# How many seconds between each rescan
-INTERVAL = 30
+INOTIFYIGNORE = ('IN_ACCESS', 'IN_OPEN', 'IN_CLOSE_NOWRITE')
+
+# How many seconds between each requery
+INTERVAL = 5
 
 RESTOREDEFAULT = 1
 EMAILDEFAULT = 0
@@ -52,7 +57,112 @@ EMAILSUBJECT = {"metadata": "File integrity failed - Metadata",
                 "deletion": "File deletion detected",
                 "modtime": "File modification time changed"}
 
-exitFlag = 0
+exitFlag = False
+
+
+def displayStatus():
+    # Prints info about file enrollment
+
+    if (not isEnvironmentValid()):
+        return 1
+
+    with sqlite3.connect(DBFILE) as conn:
+        print("AutoRestore -- AutoEmail -- Degraded -- Path")
+        print(('--------------------------------------------------------------'
+               '------------------'))
+        for row in conn.execute('''SELECT
+                                Path,
+                                AutoRestore,
+                                AutoEmail,
+                                Degraded
+                                FROM Files;'''):
+            path = row[0]
+            autoRestore = row[1]
+            autoEmail = row[2]
+            degraded = row[3]
+            print("{} -- {} -- {} -- {}"
+                  .format(str(autoRestore), str(autoEmail),
+                          str(degraded), path))
+    return 0
+
+
+def displayFileStatus():
+    # Prints specific metadata about each file
+
+    if (not isEnvironmentValid()):
+        return 1
+
+    with sqlite3.connect(DBFILE) as conn:
+        print(('Checksum (' + CHECKSUMTOOL + ') -- Permission -- Owner:'
+               'Group -- ModTime -- Path'))
+        print(('--------------------------------------------------------------'
+               '------------------'))
+        for row in conn.execute('''SELECT
+                                f.Path,            -- 0
+                                f.GoodChecksum,    -- 1
+                                d.FilePermission,  -- 2
+                                d.FileOwner,       -- 3
+                                d.FileGroup,       -- 4
+                                d.FileModTime      -- 5
+                                FROM Files as f
+                                JOIN FileData as d
+                                ON f.FileID == d.FileID;'''):
+            path = row[0]
+            goodChecksum = row[1]
+            goodPermission = row[2]
+            goodOwner = row[3]
+            goodGroup = row[4]
+            goodModTime = row[5]
+            print("{}.. -- {} -- {}:{} -- {} -- {}"
+                  .format(goodChecksum[:20], goodPermission, goodOwner,
+                          goodGroup, goodModTime, path))
+    return 0
+
+
+def displayLog():
+    # Prints event log
+
+    if (not isEnvironmentValid()):
+        return 1
+
+    with sqlite3.connect(DBFILE) as conn:
+        print("Timestamp -- Mismatch -- Path")
+        print(('--------------------------------------------------------------'
+               '------------------'))
+        for row in conn.execute('''SELECT
+                                f.Path,
+                                l.Timestamp,
+                                l.MismatchType
+                                FROM Files as f
+                                JOIN Logs as l
+                                ON f.FileID == l.FileID;'''):
+            path = row[0]
+            timestamp = row[1]
+            mismatchType = row[2]
+            print("{} -- {} -- {}"
+                  .format(str(timestamp), mismatchType, path))
+    return 0
+
+
+def displayInotifyLog():
+    # Prints inotify log
+
+    if (not isEnvironmentValid()):
+        return 1
+
+    print("Timestamp -- Raw")
+    print(('--------------------------------------------------------------'
+           '------------------'))
+    with sqlite3.connect(DBFILE) as conn:
+        for row in conn.execute('''SELECT
+                        Timestamp,
+                        Data
+                        FROM InotifyEvent'''):
+            timestamp = row[0]
+            data = row[1]
+            print("{} -- {}"
+                  .format(str(timestamp), data))
+    return 0
 
 
 def sendEmail(content):
@@ -62,10 +172,10 @@ def sendEmail(content):
         f.write(content)
     with open(TEMPFILE, 'r') as f:
         call(["sendmail", "-t"], stdin=f)
-    call(["rm", TEMPFILE])
+    Path(TEMPFILE).unlink()
 
 
-def generateDB(inputFile):
+def generateDB(inputFile, force):
     # Takes the path of an input file containing a list of full file paths.
     # One file path of each line.
 
@@ -73,9 +183,15 @@ def generateDB(inputFile):
         print("Working directory " + WORKINGDIR + " does not exist")
         return 1
 
-    if (Path(DBFILE).is_file()):
-        print("DB file already exists")
+    if (not isFileSecure(WORKINGDIR)):
         return 1
+
+    if (Path(DBFILE).is_file()):
+        if (force):
+            Path(DBFILE).unlink()
+        else:
+            print("DB file already exists")
+            return 1
 
     if (not Path(inputFile).is_file()):
         print("Cannot access input file")
@@ -94,14 +210,16 @@ def generateDB(inputFile):
                 return 1
             for path in trackedFiles:
                 if (Path(path).is_symlink()):
-                    print("Symlinks are not supported")
+                    print("Symlinks are not supported: " + path)
+                    Path(DBFILE).unlink()
                     return 1
-                try:
-                    pipe = Popen([CHECKSUMTOOL, path], stdout=PIPE)
-                except Exception:
-                    print("Cannot open file to be tracked: " + path)
-                    call(["rm", DBFILE])
+
+                if (not Path(path).is_file()):
+                    print("Not a valid file: " + path)
+                    Path(DBFILE).unlink()
                     return 1
+
+                pipe = Popen([CHECKSUMTOOL, path], stdout=PIPE)
                 checksum = pipe.communicate()[0].decode('ascii').split(" ")[0]
 
                 metadata = getFileMetadata(path)
@@ -149,6 +267,8 @@ def enrollFile(path):
 
         conn.commit()
 
+        open(REFRESHFLAGFILE, 'w').close()
+
     return 0
 
 
@@ -169,165 +289,186 @@ def _setFileMetadata(path, permission, fileOwner, fileGroup):
     call(["chmod", permission, path])
 
 
-def performCheck():
-    # Assumes the DB has already been created
-    # Runs a round of checks, and triggers alters/restores
+def getFilePaths():
+    filePaths = []
+    with sqlite3.connect(DBFILE) as conn:
+        for row in conn.execute('''SELECT Path FROM Files WHERE Degraded = 0;'''):
+            filePaths.append(row[0])
+    return filePaths
+
+
+def performCheckAll():
+    filePaths = getFilePaths()
+    for path in filePaths:
+        performCheck(path)
+
+
+def performCheck(path):
+    # Checks the file at the specified path and alters/restores if required
+    # Returns 2 if inotify should be disabled,
+    # 1 for found mismatch, 0 otherwise
 
     with sqlite3.connect(DBFILE) as conn:
-        for row in conn.execute('''SELECT
-                                f.FileID,           -- 0
-                                f.Path,             -- 1
-                                f.GoodChecksum,     -- 2
-                                f.AutoRestore,      -- 3
-                                f.AutoEmail,        -- 4
-                                d.FilePermission,   -- 5
-                                d.FileOwner,        -- 6
-                                d.FileGroup,        -- 7
-                                d.FileModTime,      -- 8
-                                d.FileRawData       -- 9
-                                FROM Files as f
-                                JOIN FileData as d
-                                ON f.FileID = d.FileID AND f.Degraded = 0;'''):
-            fileID = row[0]
-            path = row[1]
-            goodChecksum = row[2]
-            autoRestore = row[3]
-            autoEmail = row[4]
-            goodPermission = row[5]
-            goodFileOwner = row[6]
-            goodFileGroup = row[7]
-            goodModTime = row[8]
-            goodRawData = row[9]
+        cur=conn.cursor()
+        cur.execute('''SELECT
+                    f.FileID,           -- 0
+                    f.GoodChecksum,     -- 1
+                    f.AutoRestore,      -- 2
+                    f.AutoEmail,        -- 3
+                    d.FilePermission,   -- 4
+                    d.FileOwner,        -- 5
+                    d.FileGroup,        -- 6
+                    d.FileModTime,      -- 7
+                    d.FileRawData       -- 8
+                    FROM Files as f
+                    JOIN FileData as d
+                    ON f.FileID = d.FileID AND f.Path = ?;''',(path,))
+        fileEntry = cur.fetchone()
+        fileID = fileEntry[0]
+        goodChecksum = fileEntry[1]
+        autoRestore = fileEntry[2]
+        autoEmail = fileEntry[3]
+        goodPermission = fileEntry[4]
+        goodFileOwner = fileEntry[5]
+        goodFileGroup = fileEntry[6]
+        goodModTime = fileEntry[7]
+        goodRawData = fileEntry[8]
 
-            if (not Path(path).is_file()):
-                # This indicates a file has been deleted
+        if (not Path(path).is_file()):
+            # This indicates a file has been deleted
 
-                if (autoEmail == 1):
-                    sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
-                              "\nSubject:" + EMAILSUBJECT["deletion"] + \
-                              "\n\n" + path + "\n")
+            if (autoEmail):
+                sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
+                            "\nSubject:" + EMAILSUBJECT["deletion"] + \
+                            "\n\n" + path + "\n")
 
-                _recordLogEntry(conn, fileID, "Deletion")
-                conn.commit();
+            _recordLogEntry(conn, fileID, "Deletion")
+            conn.commit();
 
-                if (autoRestore == 1):
+            if (autoRestore):
+                _recreateFile(conn=conn,
+                                path=path,
+                                rawFileData=goodRawData,
+                                permission=goodPermission,
+                                fileOwner=goodFileOwner,
+                                fileGroup=goodFileGroup)
+                return 1
+            else:
+                # If not restored, a file is marked degraded and ignored
+                _setFileDegraded(conn, fileID)
+                return 2
+
+        try:
+            pipe = Popen([CHECKSUMTOOL, path], stdout=PIPE)
+        except Exception as ex:
+            print(ex)
+            exit()
+
+        currentChecksum = pipe.communicate()[0].decode('ascii')\
+                        .split(" ")[0]
+
+        currentMetadata = getFileMetadata(path)
+
+        metadataMismatch = not ((currentMetadata["owner"] == goodFileOwner)
+                    and (currentMetadata["group"] == goodFileGroup)
+                    and (currentMetadata["permission"] == goodPermission))
+
+        checksumMismatch = goodChecksum != currentChecksum
+
+        modTimeMismatch = goodModTime != currentMetadata["modtime"]
+
+        if (checksumMismatch):
+            # Log and deal with bad data
+
+            if (autoEmail):
+                sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
+                            "\nSubject:" + EMAILSUBJECT["checksum"] + \
+                            "\n\n" + path + "\n")
+
+            _recordLogEntry(conn, fileID, "Checksum")
+
+            with open(path, 'rb') as f:
+                badRawData = f.read()
+
+            conn.execute('''INSERT INTO BadFileRecord(
+                    LogID,
+                    BadChecksum,
+                    BadRawData)
+                    VALUES ((SELECT last_insert_rowid()), ?, ?);''',
+                    (currentChecksum, sqlite3.Binary(badRawData)))
+
+            if (autoRestore):
+                _recreateFile(conn=conn,
+                                path=path,
+                                rawFileData=goodRawData,
+                                permission=goodPermission,
+                                fileOwner=goodFileOwner,
+                                fileGroup=goodFileGroup)
+                return 1
+
+            else:
+                # If not restored, a file is marked degraded and ignored
+                _setFileDegraded(conn, fileID)
+                return 2
+            
+        if (metadataMismatch):
+            # Log and deal with bad metadata
+
+            if (autoEmail):
+                sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
+                            "\nSubject:" + EMAILSUBJECT["metadata"] + \
+                            "\n\n" + path + "\n")
+
+            _recordLogEntry(conn, fileID, "Metadata")
+
+            conn.execute('''INSERT INTO BadMetadataRecord(
+                    LogID,
+                    BadOwner,
+                    BadGroup,
+                    BadPermission)
+                    VALUES ((SELECT last_insert_rowid()), ?, ?, ?);''',
+                    (currentMetadata["owner"],
+                        currentMetadata["group"],
+                        currentMetadata["permission"]))
+
+            if (autoRestore):
+                targetFile = Path(path)
+                if (targetFile.is_symlink()):
+                    targetFile.unlink()
                     _recreateFile(conn=conn,
-                                  path=path,
-                                  rawFileData=goodRawData,
-                                  permission=goodPermission,
-                                  fileOwner=goodFileOwner,
-                                  fileGroup=goodFileGroup)
+                                    path=path,
+                                    rawFileData=goodRawData,
+                                    permission=goodPermission,
+                                    fileOwner=goodFileOwner,
+                                    fileGroup=goodFileGroup)
                 else:
-                    # If not restored, a file is marked degraded and ignored
-                    _setFileDegraded(conn, fileID)
+                    _setFileMetadata(path=path,
+                                        permission=goodPermission,
+                                        fileOwner=goodFileOwner,
+                                        fileGroup=goodFileGroup)
+                    _saveModTime(conn, path)
+                return 1
+            else:
+                # If not restored, a file is marked degraded and ignored
+                _setFileDegraded(conn, fileID)
+                return 2
 
-                continue
+        if (modTimeMismatch):
+            # File contents unchanged, but modification timestamp changed
 
-            try:
-                pipe = Popen([CHECKSUMTOOL, path], stdout=PIPE)
-            except Exception as ex:
-                print(ex)
-                exit()
+            if (autoEmail):
+                sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
+                            "\nSubject:" + EMAILSUBJECT["modtime"] + \
+                            "\n\n" + path + "\n")
 
-            currentChecksum = pipe.communicate()[0].decode('ascii')\
-                            .split(" ")[0]
+            _recordLogEntry(conn, fileID, "ModifyTime")
+            _saveModTime(conn, path)
 
-            currentMetadata = getFileMetadata(path)
+            return 1
 
-            metadataMismatch = not ((currentMetadata["owner"] == goodFileOwner)
-                        and (currentMetadata["group"] == goodFileGroup)
-                        and (currentMetadata["permission"] == goodPermission))
+        _recordLogEntry(conn, fileID, "_validate")
 
-            checksumMismatch = goodChecksum != currentChecksum
-
-            modTimeMismatch = goodModTime != currentMetadata["modtime"]
-
-            if (metadataMismatch):
-                # Log and deal with bad metadata
-
-                if (autoEmail == 1):
-                    sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
-                              "\nSubject:" + EMAILSUBJECT["metadata"] + \
-                              "\n\n" + path + "\n")
-
-                _recordLogEntry(conn, fileID, "Metadata")
-
-                conn.execute('''INSERT INTO BadMetadataRecord(
-                        LogID,
-                        BadOwner,
-                        BadGroup,
-                        BadPermission)
-                        VALUES ((SELECT last_insert_rowid()), ?, ?, ?);''',
-                        (currentMetadata["owner"],
-                         currentMetadata["group"],
-                         currentMetadata["permission"]))
-
-                if (autoRestore == 1):
-                    targetFile = Path(path)
-                    if (targetFile.is_symlink()):
-                        targetFile.unlink()
-                        _recreateFile(conn=conn,
-                                      path=path,
-                                      rawFileData=goodRawData,
-                                      permission=goodPermission,
-                                      fileOwner=goodFileOwner,
-                                      fileGroup=goodFileGroup)
-                    else:
-                        _setFileMetadata(path=path,
-                                         permission=goodPermission,
-                                         fileOwner=goodFileOwner,
-                                         fileGroup=goodFileGroup)
-                else:
-                    # If not restored, a file is marked degraded and ignored
-                    _setFileDegraded(conn, fileID)
-
-                conn.commit();
-
-            if (checksumMismatch):
-                # Log and deal with bad data
-
-                if (autoEmail == 1):
-                    sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
-                              "\nSubject:" + EMAILSUBJECT["checksum"] + \
-                              "\n\n" + path + "\n")
-
-                _recordLogEntry(conn, fileID, "Checksum")
-
-                with open(path, 'rb') as f:
-                    badRawData = f.read()
-
-                conn.execute('''INSERT INTO BadFileRecord(
-                        LogID,
-                        BadChecksum,
-                        BadRawData)
-                        VALUES ((SELECT last_insert_rowid()), ?, ?);''',
-                        (currentChecksum, sqlite3.Binary(badRawData)))
-
-                if (autoRestore == 1):
-                    _recreateFile(conn=conn,
-                                  path=path,
-                                  rawFileData=goodRawData,
-                                  permission=goodPermission,
-                                  fileOwner=goodFileOwner,
-                                  fileGroup=goodFileGroup)
-
-                else:
-                    # If not restored, a file is marked degraded and ignored
-                    _setFileDegraded(conn, fileID)
-
-                conn.commit();
-
-            elif (modTimeMismatch):
-                # File contents unchanged, but modification timestamp changed
-
-                if (autoEmail == 1):
-                    sendEmail("To:" + EMAIL + "\nFrom:" + EMAIL + \
-                              "\nSubject:" + EMAILSUBJECT["modtime"] + \
-                              "\n\n" + path + "\n")
-
-                _recordLogEntry(conn, fileID, "ModTime ")
-
-                _saveModTime(conn, path)
+        return 0
 
 
 def _createFileEntry(conn, path, checksum, metadata, fileRawData):
@@ -386,9 +527,18 @@ def _saveModTime(conn, path):
         WHERE FileID = (SELECT FileID FROM Files WHERE Path = ?);''',
                  (currentMetadata["modtime"], path))
 
+def _RecordInotifyLog(data):
+
+    with sqlite3.connect(DBFILE) as conn:
+        conn.execute('''INSERT INTO InotifyEvent(
+            Data)
+            VALUES (?);''',
+            (str(data),))
+
 
 def getFileMetadata(path):
-    # Give the path to a file, return a dict with its metadata
+    # Takes path to a file or directory
+    # Returns a dict with its metadata
 
     targetFile = Path(path)
 
@@ -400,90 +550,6 @@ def getFileMetadata(path):
             "modtime":str(round(targetFile.stat().st_mtime))}
 
 
-def displayStatus():
-    # Prints info about file enrollment
-
-    if (validateEnvironment() == 1):
-        return 1
-
-    with sqlite3.connect(DBFILE) as conn:
-        print("AutoRestore -- AutoEmail -- Degraded -- Path")
-        print(('--------------------------------------------------------------'
-               '------------------'))
-        for row in conn.execute('''SELECT
-                                Path,
-                                AutoRestore,
-                                AutoEmail,
-                                Degraded
-                                FROM Files;'''):
-            path = row[0]
-            autoRestore = row[1]
-            autoEmail = row[2]
-            degraded = row[3]
-            print("{}           -- {}         -- {}        --  {}"
-                  .format(str(autoRestore), str(autoEmail),
-                          str(degraded), path))
-    return 0
-
-
-def displayFileStatus():
-    # Prints specific metadata about each file
-
-    if (validateEnvironment() == 1):
-        return 1
-
-    with sqlite3.connect(DBFILE) as conn:
-        print(('Checksum (' + CHECKSUMTOOL + ')       -- Permission  -- Owner:'
-               'Group -- ModTime      -- Path'))
-        print(('--------------------------------------------------------------'
-               '------------------'))
-        for row in conn.execute('''SELECT
-                                f.Path,            -- 0
-                                f.GoodChecksum,    -- 1
-                                d.FilePermission,  -- 2
-                                d.FileOwner,       -- 3
-                                d.FileGroup,       -- 4
-                                d.FileModTime      -- 5
-                                FROM Files as f
-                                JOIN FileData as d
-                                ON f.FileID == d.FileID;'''):
-            path = row[0]
-            goodChecksum = row[1]
-            goodPermission = row[2]
-            goodOwner = row[3]
-            goodGroup = row[4]
-            goodModTime = row[5]
-            print("{}..     -- {}         -- {}:{}   -- {}   -- {}"
-                  .format(goodChecksum[:20], goodPermission, goodOwner,
-                          goodGroup, goodModTime, path))
-    return 0
-
-
-def displayLog():
-    # Prints event log
-
-    if (validateEnvironment() == 1):
-        return 1
-
-    with sqlite3.connect(DBFILE) as conn:
-        print("Timestamp            --  Mismatch  --  Path")
-        print(('--------------------------------------------------------------'
-               '------------------'))
-        for row in conn.execute('''SELECT
-                                f.Path,
-                                l.Timestamp,
-                                l.MismatchType
-                                FROM Files as f
-                                JOIN Logs as l
-                                ON f.FileID == l.FileID;'''):
-            path = row[0]
-            timestamp = row[1]
-            mismatchType = row[2]
-            print("{}  --  {}  --  {}"
-                  .format(str(timestamp), mismatchType, path))
-    return 0
-
-
 def shutdown(signum, frame):
     # Responds to SIGTERM and SIGTSTP
 
@@ -491,91 +557,170 @@ def shutdown(signum, frame):
     if (commandFile.exists()):
         commandFile.unlink()
     global exitFlag
-    exitFlag = 1
+    exitFlag = True
 
 
 def main():
 
     global exitFlag
 
-    if (Path(DAEMONLOCK).is_file()):
-        exitFlag = 1
+    if (Path(COMMANDFILE).is_file()):
+        exitFlag = True
+        return
 
-    while (exitFlag == 0):
-        performCheck()
-        with open(COMMANDFILE, 'w') as f:
-            f.write("Daemon running!\nLast check " + \
-                    str(datetime.now()) + "\n")
+    open(COMMANDFILE, 'w').close()
+
+    recheck = set()
+    i = inotify.adapters.Inotify()
+    filePaths = getFilePaths()
+    for path in filePaths:
+        i.add_watch(path)
+
+    while (not exitFlag):
+        inotifyEvents = i.event_gen(yield_nones=False, timeout_s=0.1)
+        eventsOfNote = [(attr[2], attr[1]) for attr in inotifyEvents \
+                        if attr[1][0] not in INOTIFYIGNORE]
+
+        if (len(eventsOfNote)):
+            _RecordInotifyLog(eventsOfNote)
+
+        pathsToCheck = list(set([e[0] for e in eventsOfNote]).union(recheck))
+        reloadNeeded = False
+
+        newRecheck = set()
+        for path in pathsToCheck:
+            checkResult = performCheck(path)
+            if (checkResult == 2):
+                i.remove_watch(path)
+            elif (checkResult == 1 or (path not in recheck)):
+                reloadNeeded = True
+                newRecheck.add(path)
+
+        refreshFlag = Path(REFRESHFLAGFILE).is_file()
+        recheck = newRecheck
+
+        if (refreshFlag or reloadNeeded):
+            i = inotify.adapters.Inotify()
+            filePaths = getFilePaths()
+            for path in filePaths:
+                i.add_watch(path)
+                recheck.add(path)
+            if (refreshFlag):
+                Path(REFRESHFLAGFILE).unlink()
+
+        if (Path(COMMANDFILE).is_file()):
+            with open(COMMANDFILE, 'w') as f:
+                f.write("Daemon running!\nLast check " + \
+                        str(datetime.now()) + "\n")
+
         timeToCheck = INTERVAL
-        while (exitFlag == 0 and timeToCheck > 0):
+        while (not(exitFlag) and timeToCheck > 0):
             if (not Path(COMMANDFILE).is_file()):
-                exitFlag = 1
+                exitFlag = True
             timeToCheck -= 1
             sleep(1)
 
 
-def validateEnvironment():
+def isFileSecure(path):
+    # Returns true if give file or dir is properly locked down
+
+    fileMetadata = getFileMetadata(path)
+    if (fileMetadata["owner"] != "root"):
+        print(path + " is not owned by root (this is very insecure)")
+        return False
+    if (fileMetadata["group"] != "root"):
+        print(path + " does not belong to the root group")
+        return False
+    if (fileMetadata["permission"][-1] != "0"):
+        print(path + "'s permission is insecure (last octal must be 0)")
+        return False
+
+    return True
+
+
+def isEnvironmentValid():
     # Validates if the system is in a ready-to-run state
 
     if (INTERVAL < 1):
         print("Constant INTERVAL must NOT be less than 1")
-        return 1
+        return False
     if (RESTOREDEFAULT not in (0, 1)):
         print("Constant AUTORESTOREDEFAULT must be 0 or 1")
-        return 1
+        return False
     if (EMAILDEFAULT not in (0, 1)):
         print("Constant AUTOEMAILDEFAULT must be 0 or 1")
-        return 1
+        return False
     if (not Path(DBFILE).is_file()):
         print("DB file does not exist")
-        return 1
+        return False
+    if (not isFileSecure(DBFILE)):
+        return False
+    if (not isFileSecure(WORKINGDIR)):
+        return False
 
-    dbFileMetadata = getFileMetadata(DBFILE)
-    if (dbFileMetadata["owner"] != "root"):
-        print("DB file is not owned by root (this is very insecure)")
-        return 1
-    if (dbFileMetadata["group"] != "root"):
-        print("DB file is not in the root group")
-        return 1
-    if (dbFileMetadata["permission"][-1] != "0"):
-        print("DB file's permission is insecure (last digit must be 0)")
-        return 1
-
-    return 0
+    return True
 
 
 if __name__ == "__main__":
-    if (len(argv) == 1):
-        print("sen.py [generate filelist.txt] | [daemon] | [status] " + \
-              "| [log] | [checkonce] | [daemonstop] | " + \
-              "[enroll \"/path/to/file\"] | [filestatus]")
+
+    try:
+        optList = gnu_getopt(argv[1:],"fcg:d:l:e", ["force", "checkall",
+                             "generate=", "daemon=", "log=", "enroll="])[0]
+    except GetoptError as ex:
+        print(ex)
         exit()
 
-    if (len(argv) == 2):
-        if (argv[1] == "status"):
+    if (len(optList) == 0):
+        print("sen.py (--generate <filelist.txt> | --daemon (start | stop)" + \
+              " | --log (status | files | event | inotify) | --checkall" + \
+              " | --enroll <\"/path/to/file\">) [--force]")
+        print("sen.py (-g <filelist.txt> | -d (start | stop) | " + \
+              "-l (status | files | event | inotify)" + \
+              " | -c | -e <\"/path/to/file\">) [-f]")
+        exit()
+
+
+    if (len(optList) > 1):
+        if (optList[1][0] not in ("-f", "--force") or len(optList) > 2):
+            print("Too many parameters provided")
+            exit()
+
+
+    force = False
+    if (len(optList) == 2):
+        force = (optList[1][0] in ("-f", "--force"))
+
+    opt = optList[0]
+
+    if (opt[0] in ("-l", "--log")):
+        if (opt[1] == "status"):
             displayStatus()
-        elif (argv[1] == "filestatus"):
+        elif (opt[1] == "files"):
             displayFileStatus()
-        elif (argv[1] == "log"):
+        elif (opt[1] == "event"):
             displayLog()
-        elif (argv[1] == "checkonce"):
-            if (validateEnvironment() != 0):
-                print("Cannot perform one-time check")
+        elif (opt[1] == "inotify"):
+            displayInotifyLog()
+        else:
+            print("Invalid option, expecting status | files | event | inotify")
+
+    if (opt[0] in ("-c", "--checkall")):
+        if (not isEnvironmentValid()):
+            print("Not set up properly to perform manual check")
+        else:
+            if Path(COMMANDFILE).is_file():
+                print("Daemon is currently running")
+                print("Stop daemon before running manual check")
             else:
-                performCheck()
-        elif (argv[1] == "daemonstop"):
-            commandFile = Path(COMMANDFILE)
-            if (commandFile.exists()):
-                print("Signalling daemon to stop")
-                commandFile.unlink()
-            else:
-                print("Daemon is not running")
-        elif (argv[1] == "daemon"):
-            commandFile = Path(COMMANDFILE)
-            if (validateEnvironment() != 0):
-                print("Cannot start daemon")
-            elif (commandFile.exists()):
-                print("Daemon is already running")
+                performCheckAll()
+
+    if (opt[0] in ("-d", "--daemon")):
+        if (opt[1] == "start"):
+            comFile = Path(COMMANDFILE)
+            if (not isEnvironmentValid()):
+                print("Not set up properly to start daemon")
+            elif (comFile.exists()):
+                print("Daemon is already running - cannot start")
             else:
                 print("Starting up daemon...")
                 with daemon.DaemonContext(
@@ -585,21 +730,25 @@ if __name__ == "__main__":
                                 SIGTERM: shutdown,
                                 SIGTSTP: shutdown}):
                     main()
+        elif (opt[1] == "stop"):
+            comFile = Path(COMMANDFILE)
+            if (comFile.exists()):
+                print("Daemon lock detected - signalling to stop")
+                comFile.unlink()
+            else:
+                print("Daemon is not running")
         else:
-            print("Unrecognized command")
-        exit()
+            print("Invalid option, expecting start | stop")
+            exit()
 
-    if (len(argv) == 3):
-        if (argv[1] == "generate"):
-            if (generateDB(argv[2]) == 0):
-                print("DB generation successful")
-            else:
-                print("DB generation failure")
-        elif (argv[1] == "enroll"):
-            if (not Path(argv[2]).is_file()):
-                print("Invalid file: " + argv[2])
-            else:
-                enrollFile(argv[2])
+    if (opt[0] in ("-g", "--generate")):
+        if (generateDB(opt[1], force) == 0):
+            print("DB generation successful")
         else:
-            print("Unrecognized command")
-        exit()
+            print("DB generation failure")
+
+    if (opt[0] in ("-e", "--enroll")):
+        if (not Path(argv[2]).is_file()):
+            print("Invalid file: " + argv[2])
+        else:
+            enrollFile(argv[2])
